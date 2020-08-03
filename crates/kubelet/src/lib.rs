@@ -6,7 +6,10 @@
 //!
 //! # Example
 //! ```rust,no_run
-//! use kubelet::{Provider, Pod, Kubelet, config::Config};
+//! use kubelet::Kubelet;
+//! use kubelet::config::Config;
+//! use kubelet::pod::Pod;
+//! use kubelet::provider::Provider;
 //!
 //! // Create some type that will act as your provider
 //! struct MyProvider;
@@ -23,7 +26,7 @@
 //!     // Implement the rest of the methods
 //!     # async fn modify(&self, pod: Pod) -> anyhow::Result<()> { todo!() }
 //!     # async fn delete(&self, pod: Pod) -> anyhow::Result<()> { todo!() }
-//!     # async fn logs(&self, namespace: String, pod: String, container: String) -> anyhow::Result<Vec<u8>> { todo!() }
+//!     # async fn logs(&self, namespace: String, pod: String, container: String, sender: kubelet::log::Sender) -> anyhow::Result<()> { todo!() }
 //! }
 //!
 //! async {
@@ -36,7 +39,7 @@
 //!     let kubelet_config = Config::default();
 //!
 //!     // Instantiate the Kubelet
-//!     let kubelet = Kubelet::new(provider, kubeconfig, kubelet_config);
+//!     let kubelet = Kubelet::new(provider, kubeconfig, kubelet_config).await.unwrap();
 //!     // Start the Kubelet and block on it
 //!     kubelet.start().await.unwrap();
 //! };
@@ -45,22 +48,21 @@
 #![deny(missing_docs)]
 #![cfg_attr(feature = "docs", feature(doc_cfg))]
 
+mod bootstrapping;
 mod kubelet;
-mod node;
-mod pod;
-mod queue;
-mod server;
+
+pub(crate) mod kubeconfig;
+pub(crate) mod webserver;
 
 pub mod config;
+pub mod container;
 pub mod handle;
-pub mod image_client;
-pub mod module_store;
+pub mod log;
+pub mod node;
+pub mod pod;
 pub mod provider;
-pub mod status;
-pub mod volumes;
+pub mod store;
+pub mod volume;
 
 pub use self::kubelet::Kubelet;
-pub use handle::{PodHandle, RuntimeHandle};
-pub use pod::Pod;
-#[doc(inline)]
-pub use provider::Provider;
+pub use bootstrapping::bootstrap;

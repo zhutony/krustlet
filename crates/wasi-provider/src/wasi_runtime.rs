@@ -1,34 +1,39 @@
+use anyhow::bail;
+use log::{debug, error, info};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::bail;
-use log::{error, info, warn};
 use tempfile::NamedTempFile;
-use tokio::sync::watch::{self, Sender};
+use tokio::sync::{
+    oneshot,
+    watch::{self, Sender},
+};
 use tokio::task::JoinHandle;
 use wasi_common::preopen_dir;
+use wasmtime::InterruptHandle;
 use wasmtime_wasi::old::snapshot_0::Wasi as WasiUnstable;
 use wasmtime_wasi::{Wasi, WasiCtxBuilder};
 
-use kubelet::handle::{RuntimeHandle, Stop};
-use kubelet::status::ContainerStatus;
+use kubelet::container::Handle as ContainerHandle;
+use kubelet::container::Status;
+use kubelet::handle::StopHandler;
 
-pub struct HandleStopper {
-    pub handle: JoinHandle<anyhow::Result<()>>,
+pub struct Runtime {
+    handle: JoinHandle<anyhow::Result<()>>,
+    interrupt_handle: InterruptHandle,
 }
 
 #[async_trait::async_trait]
-impl Stop for HandleStopper {
+impl StopHandler for Runtime {
     async fn stop(&mut self) -> anyhow::Result<()> {
-        // TODO: Send an actual stop signal once there is support in wasmtime
-        warn!("There is currently no way to stop a running wasmtime instance. The pod will be deleted, but any long running processes will keep running");
+        self.interrupt_handle.interrupt();
         Ok(())
     }
 
     async fn wait(&mut self) -> anyhow::Result<()> {
-        // Uncomment this and actually wait for the process to finish once we have a way to stop
-        // (&mut self.handle).await.unwrap()
+        (&mut self.handle).await??;
         Ok(())
     }
 }
@@ -53,6 +58,18 @@ struct Data {
     /// (e.g. /tmp/foo/myfile -> /app/config). If the optional value is not given,
     /// the same path will be allowed in the runtime
     dirs: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+/// Holds our tempfile handle.
+pub struct HandleFactory {
+    temp: Arc<NamedTempFile>,
+}
+
+impl kubelet::log::HandleFactory<tokio::fs::File> for HandleFactory {
+    /// Creates `tokio::fs::File` on demand for log reading.
+    fn new_handle(&self) -> tokio::fs::File {
+        tokio::fs::File::from_std(self.temp.reopen().unwrap())
+    }
 }
 
 impl WasiRuntime {
@@ -96,26 +113,31 @@ impl WasiRuntime {
         })
     }
 
-    pub async fn start(&self) -> anyhow::Result<RuntimeHandle<HandleStopper, tokio::fs::File>> {
+    pub async fn start(&self) -> anyhow::Result<ContainerHandle<Runtime, HandleFactory>> {
         let temp = self.output.clone();
         // Because a reopen is blocking, run in a blocking task to get new
         // handles to the tempfile
-        let (output_write, output_read) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(std::fs::File, std::fs::File)> {
-                Ok((temp.reopen()?, temp.reopen()?))
-            },
-        )
+        let output_write = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+            Ok(temp.reopen()?)
+        })
         .await??;
 
-        let (status_sender, status_recv) = watch::channel(ContainerStatus::Waiting {
+        let (status_sender, status_recv) = watch::channel(Status::Waiting {
             timestamp: chrono::Utc::now(),
             message: "No status has been received from the process".into(),
         });
-        let handle = self.spawn_wasmtime(status_sender, output_write);
+        let (interrupt_handle, handle) = self.spawn_wasmtime(status_sender, output_write).await?;
 
-        Ok(RuntimeHandle::new(
-            HandleStopper { handle },
-            tokio::fs::File::from_std(output_read),
+        let log_handle_factory = HandleFactory {
+            temp: self.output.clone(),
+        };
+
+        Ok(ContainerHandle::new(
+            Runtime {
+                handle,
+                interrupt_handle,
+            },
+            log_handle_factory,
             status_recv,
         ))
     }
@@ -123,22 +145,24 @@ impl WasiRuntime {
     // Spawns a running wasmtime instance with the given context and status
     // channel. Due to the Instance type not being Send safe, all of the logic
     // needs to be done within the spawned task
-    fn spawn_wasmtime(
+    async fn spawn_wasmtime(
         &self,
-        status_sender: Sender<ContainerStatus>,
+        status_sender: Sender<Status>,
         output_write: std::fs::File,
-    ) -> JoinHandle<anyhow::Result<()>> {
+    ) -> anyhow::Result<(InterruptHandle, JoinHandle<anyhow::Result<()>>)> {
         // Clone the module data Arc so it can be moved
         let data = self.data.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (tx, rx) = oneshot::channel();
+
+        let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Build the WASI instance and then generate a list of WASI modules
             let mut ctx_builder_snapshot = WasiCtxBuilder::new();
             let mut ctx_builder_snapshot = ctx_builder_snapshot
                 .args(&data.args)
                 .envs(&data.env)
-                .stdout(output_write.try_clone()?)
-                .stderr(output_write.try_clone()?);
+                .stdout(wasi_common::OsFile::try_from(output_write.try_clone()?)?)
+                .stderr(wasi_common::OsFile::try_from(output_write.try_clone()?)?);
             let mut ctx_builder_unstable = wasi_common::old::snapshot_0::WasiCtxBuilder::new();
             let mut ctx_builder_unstable = ctx_builder_unstable
                 .args(&data.args)
@@ -148,6 +172,11 @@ impl WasiRuntime {
 
             for (key, value) in data.dirs.iter() {
                 let guest_dir = value.as_ref().unwrap_or(key);
+                debug!(
+                    "mounting hostpath {} as guestpath {}",
+                    key.display(),
+                    guest_dir.display()
+                );
                 ctx_builder_snapshot =
                     ctx_builder_snapshot.preopened_dir(preopen_dir(key)?, guest_dir);
                 ctx_builder_unstable =
@@ -155,11 +184,17 @@ impl WasiRuntime {
             }
             let wasi_ctx_snapshot = ctx_builder_snapshot.build()?;
             let wasi_ctx_unstable = ctx_builder_unstable.build()?;
-            let engine = wasmtime::Engine::default();
+            let mut config = wasmtime::Config::new();
+            config.interruptable(true);
+            let engine = wasmtime::Engine::new(&config);
             let store = wasmtime::Store::new(&engine);
+            let interrupt = store.interrupt_handle()?;
+            tx.send(interrupt)
+                .map_err(|_| anyhow::anyhow!("Unable to send interrupt back to main thread"))?;
+
             let wasi_snapshot = Wasi::new(&store, wasi_ctx_snapshot);
             let wasi_unstable = WasiUnstable::new(&store, wasi_ctx_unstable);
-            let module = match wasmtime::Module::new(&store, &data.module_data) {
+            let module = match wasmtime::Module::new(&engine, &data.module_data) {
                 // We can't map errors here or it moves the send channel, so we
                 // do it in a match
                 Ok(m) => m,
@@ -167,7 +202,7 @@ impl WasiRuntime {
                     let message = "unable to create module";
                     error!("{}: {:?}", message, e);
                     status_sender
-                        .broadcast(ContainerStatus::Terminated {
+                        .broadcast(Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
@@ -179,7 +214,6 @@ impl WasiRuntime {
             // Iterate through the module includes and resolve imports
             let imports = module
                 .imports()
-                .iter()
                 .map(|i| {
                     // This is super funky logic, but it matches what is in 0.12.0
                     let export = match i.module() {
@@ -205,7 +239,7 @@ impl WasiRuntime {
                     let message = "unable to load module";
                     error!("{}: {:?}", message, e);
                     status_sender
-                        .broadcast(ContainerStatus::Terminated {
+                        .broadcast(Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
@@ -215,7 +249,7 @@ impl WasiRuntime {
                 }
             };
 
-            let instance = match wasmtime::Instance::new(&module, &imports) {
+            let instance = match wasmtime::Instance::new(&store, &module, &imports) {
                 // We can't map errors here or it moves the send channel, so we
                 // do it in a match
                 Ok(m) => m,
@@ -223,7 +257,7 @@ impl WasiRuntime {
                     let message = "unable to instantiate module";
                     error!("{}: {:?}", message, e);
                     status_sender
-                        .broadcast(ContainerStatus::Terminated {
+                        .broadcast(Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
@@ -238,17 +272,22 @@ impl WasiRuntime {
             // need to do a bit more to pass them in here.
             info!("starting run of module");
             status_sender
-                .broadcast(ContainerStatus::Running {
+                .broadcast(Status::Running {
                     timestamp: chrono::Utc::now(),
                 })
                 .expect("status should be able to send");
-            match instance
+            let export = instance
                 .get_export("_start")
-                .expect("_start import should exist in wasm module")
-                .func()
-                .unwrap()
-                .call(&[])
-            {
+                .ok_or_else(|| anyhow::anyhow!("_start import doesn't exist in wasm module"))?;
+            let func = match export {
+                wasmtime::Extern::Func(f) => f,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                    "_start import was not a function. This is likely a problem with the module"
+                ))
+                }
+            };
+            match func.call(&[]) {
                 // We can't map errors here or it moves the send channel, so we
                 // do it in a match
                 Ok(_) => {}
@@ -256,7 +295,7 @@ impl WasiRuntime {
                     let message = "unable to run module";
                     error!("{}: {:?}", message, e);
                     status_sender
-                        .broadcast(ContainerStatus::Terminated {
+                        .broadcast(Status::Terminated {
                             failed: true,
                             message: message.into(),
                             timestamp: chrono::Utc::now(),
@@ -268,13 +307,16 @@ impl WasiRuntime {
 
             info!("module run complete");
             status_sender
-                .broadcast(ContainerStatus::Terminated {
+                .broadcast(Status::Terminated {
                     failed: false,
                     message: "Module run completed".into(),
                     timestamp: chrono::Utc::now(),
                 })
                 .expect("status should be able to send");
             Ok(())
-        })
+        });
+        // Wait for the interrupt to be sent back to us
+        let interrupt = rx.await?;
+        Ok((interrupt, handle))
     }
 }

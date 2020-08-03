@@ -8,7 +8,7 @@ To build krustlet, you will need
 
 - The latest stable version of Rust
 - The latest version of [just](https://github.com/casey/just)
-- openssl
+- openssl (Or use the [`rustls-tls`](#building-without-openssl) feature)
 - git
 
 If you want to test krustlet, you will also require
@@ -28,6 +28,57 @@ We use `just` to build our programs, but you can use `cargo` if you want:
 ```console
 $ just build
 ```
+
+### Building without openssl
+
+If you are on a system that doesn't have OpenSSL (or has the incorrect version), you have the option
+to build Krustlet using the Rustls project (Rust native TLS implementation):
+
+```shell
+$ just build --no-default-features --features rustls-tls
+```
+
+The same flags can be passed to `just run-wasi` and `just run-wascc` if you want to just
+[run](#running) the project instead.
+
+#### Caveats
+
+The underlying dependencies for Rustls do not support certs with IP SANs (subject alternate names).
+Because of this, the serving certs requested during bootstrap will not work for local development
+options like minikube or KinD as they do not have an FQDN
+
+### Building on WSL (Windows Subsystem for Linux)
+
+You can build Krustlet on WSL but will need a few prerequisites that aren't included in the
+Ubuntu distro in the Microsoft Store:
+
+```
+sudo apt install build-essential
+sudo apt-get install libssl-dev
+sudo apt-get install pkg-config
+```
+
+**NOTE:** We've had mixed success developing Krustlet on WSL.  It has been successfully
+run on WSL2 using the WSL2-enabled Docker Kubernetes or Azure Kubernetes.  If you're
+on WSL1 you may be better off running in a full Linux VM under Hyper-V.
+
+### Building on Windows
+
+As of version 0.4, we have support for building on Windows. For convenience sake, there is a windows
+version of the justfile called `justfile-windows`. This justfile uses PowerShell and has the proper
+flags set for Windows builds. To use it, you'll have to specify the justfile using the `--justfile`
+flag like so:
+
+```powershell
+just --justfile justfile-windows build
+```
+
+It has all the same targets as the normal justfile, however, the `test` target runs a little
+differently than the normal target due to how we use feature flags. This means there will be some
+spurious warning output from `clippy`, but the tests will run.
+
+**NOTE:** Windows builds use the `rustls` library, which means there are some things to be aware of.
+See the [caveats](#caveats) section for more details
 
 ## Running
 

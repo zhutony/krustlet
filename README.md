@@ -1,7 +1,7 @@
 # Krustlet: Kubernetes Kubelet in Rust for running WASM
 
 :construction: :construction: **This project is highly experimental.** :construction: :construction:
-It is not yet fully ready for production, so you should use it in production at your own risk
+It should not be used in production workloads.
 
 Krustlet acts as a Kubelet by listening on the event stream for new pods that
 the scheduler assigns to it based on specific Kubernetes
@@ -15,10 +15,18 @@ those workloads to run in a `wasmtime`-based runtime instead of a container runt
 If you're new to the project, get started with [the introduction](docs/intro/README.md). For more
 in-depth information about Krustlet, plunge right into the [topic guides](docs/topics/README.md).
 
-Looking for the developer guide? [Start here](docs/community/developers.md). If you are interested
-in the project, please feel free to join us in our weekly public call [on
-Zoom](https://zoom.us/j/200921512?pwd=N3hBblRaUE1FL3luVkJ6ZzZsM0NIUT09) at 9:00 am Pacific Time
-every Monday
+Looking for the developer guide? [Start here](docs/community/developers.md). 
+
+## Community, discussion, contribution, and support
+
+You can reach the Krustlet community and developers via the following channels:
+
+- [Kubernetes Slack](https://kubernetes.slack.com):
+  - [#krustlet](https://kubernetes.slack.com/messages/krustlet)
+- Public Community Call on Mondays at 9:00 AM PT:
+  - [Zoom](https://zoom.us/j/200921512?pwd=N3hBblRaUE1FL3luVkJ6ZzZsM0NIUT09)
+  - Download the meeting calendar invite [here](https://raw.githubusercontent.com/deislabs/krustlet/master/docs/community/assets/community_meeting.ics)
+
 
 ## Code of Conduct
 

@@ -1,7 +1,8 @@
 name: Build and Test
-
-on: [pull_request]
-
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
 jobs:
   build:
     runs-on: ${{ matrix.config.os }}
@@ -11,25 +12,25 @@ jobs:
         config:
           - {
               os: "ubuntu-latest",
-              url: "https://github.com/casey/just/releases/download/v0.5.8/just-v0.5.8-x86_64-unknown-linux-musl.tar.gz",
+              url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz",
               name: "just",
               pathInArchive: "just",
             }
           - {
               os: "macos-latest",
-              url: "https://github.com/casey/just/releases/download/v0.5.8/just-v0.5.8-x86_64-apple-darwin.tar.gz",
+              url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-apple-darwin.tar.gz",
               name: "just",
               pathInArchive: "just",
             }
     steps:
       - uses: actions/checkout@v2
-      - uses: engineerd/configurator@v0.0.1
+      - uses: engineerd/configurator@v0.0.2
         with:
           name: ${{ matrix.config.name }}
           url: ${{ matrix.config.url }}
           pathInArchive: ${{ matrix.config.pathInArchive }}
       # hack(bacongobbler): install rustfmt to work around darwin toolchain issues
-      - name: '(macOS) install dev tools'
+      - name: "(macOS) install dev tools"
         if: runner.os == 'macOS'
         run: |
           rustup component add rustfmt --toolchain stable-x86_64-apple-darwin
@@ -38,25 +39,51 @@ jobs:
         run: |
           just build
           just test
+  windows-build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        # For some reason, running with the default powershell doesn't work with the `Build` step,
+        # but bash does!
+        shell: bash
+    steps:
+      - uses: actions/checkout@v2
+      - uses: engineerd/configurator@v0.0.2
+        with:
+          name: just
+          url: "https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-pc-windows-msvc.zip"
+          pathInArchive: just.exe
+      - name: Build
+        run: |
+          just --justfile justfile-windows build
+          just --justfile justfile-windows test
+  # TODO: Figure out how to get kind or minikube running on a windows test host and see how we can
+  # get things working with rustls
+  # windows-e2e:
+  #   runs-on: windows-latest
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: engineerd/setup-kind@v0.3.0
+      - uses: engineerd/setup-kind@v0.4.0
       - uses: engineerd/configurator@v0.0.1
         with:
           name: just
-          url: https://github.com/casey/just/releases/download/v0.5.8/just-v0.5.8-x86_64-unknown-linux-musl.tar.gz
+          url: https://github.com/casey/just/releases/download/v0.5.11/just-v0.5.11-x86_64-unknown-linux-musl.tar.gz
           pathInArchive: just
       - name: Run e2e tests
         env:
           KRUSTLET_NODE_IP: "172.17.0.1"
           # The default location for the cert is not accessible on build hosts, so do it in the current dir
-          KEY_DIR: "./config"
-          PFX_PASSWORD: "testing"
+          CONFIG_DIR: "./config"
         run: |
-          just bootstrap-ssl
+          just bootstrap
           just build
-          ./target/debug/krustlet-wascc --node-name krustlet-wascc --port 3000 --pfx-path ./config/certificate.pfx &
-          ./target/debug/krustlet-wasi --node-name krustlet-wasi --port 3001 --pfx-path ./config/certificate.pfx &
+          KUBECONFIG=${CONFIG_DIR}/kubeconfig-wascc ./target/debug/krustlet-wascc --node-name krustlet-wascc --port 3000 --bootstrap-file ${CONFIG_DIR}/bootstrap.conf --cert-file ./config/krustlet-wascc.crt --private-key-file ./config/krustlet-wascc.key &
+          # Wait for things to start before approving certs and then delete so we don't overlap with the same hostname
+          sleep 5 && kubectl certificate approve $(hostname)-tls
+          sleep 2 && kubectl delete csr $(hostname)-tls 
+          KUBECONFIG=${CONFIG_DIR}/kubeconfig-wasi ./target/debug/krustlet-wasi --node-name krustlet-wasi --port 3001 --bootstrap-file ${CONFIG_DIR}/bootstrap.conf --cert-file ./config/krustlet-wasi.crt --private-key-file ./config/krustlet-wasi.key &
+          sleep 5 && kubectl certificate approve $(hostname)-tls
+          sleep 2 && kubectl delete csr $(hostname)-tls 
           just test-e2e
